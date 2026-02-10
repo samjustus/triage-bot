@@ -35,7 +35,7 @@ jobs:
 
           echo "Running search: $QUERY"
 
-          # Fetch up to 200 results; filter/sort/limit client-side
+          # Fetch up to 2000 results; filter/sort/limit client-side
           gh api graphql -f query='
             query($q: String!, $n: Int!, $after: String) {
               search(query: $q, type: ISSUE, first: $n, after: $after) {
