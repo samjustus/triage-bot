@@ -34,6 +34,7 @@ jobs:
 
           echo "Running search: $QUERY"
 
+          # Fetch up to 200 results; filter/sort/limit client-side
           gh api graphql -f query='
             query($q: String!, $n: Int!, $after: String) {
               search(query: $q, type: ISSUE, first: $n, after: $after) {
@@ -75,15 +76,20 @@ jobs:
             echo '{"data":{"search":{"nodes":[]}}}' > page2.json
           fi
 
+          # Read seen URLs into a JSON array for jq
           SEEN_JSON=$(awk 'NF {print}' .state/seen-issues.txt | jq -R -s 'split("\n") | map(select(length>0))')
 
           jq -s --argjson seen "$SEEN_JSON" '
             ([.[0].data.search.nodes[], .[1].data.search.nodes[]] |
+              # Exclude any issue with any label starting with "team/" (case-insensitive)
               map(select(
-                ([.labels.nodes[].name] | map(ascii_downcase) | any(contains("team")) | not)
+                ([.labels.nodes[].name] | map(ascii_downcase) | any(startswith("team/")) | not)
               )) |
+              # Exclude issues already emailed
               map(select(.url as $u | ($seen | index($u)) == null)) |
+              # Oldest first
               sort_by(.createdAt) |
+              # Limit to 10
               .[0:10]
             )
           ' page1.json page2.json > issues-to-email.json
@@ -91,10 +97,16 @@ jobs:
           COUNT=$(jq 'length' issues-to-email.json)
           echo "New issues to email (max 10): $COUNT"
 
+          echo "Seen list count:"
+          awk 'NF{c++} END{print c+0}' .state/seen-issues.txt
+
+          echo "Sample candidates (first 5):"
+          jq -r '.[0:5][] | "\(.createdAt) \(.url) labels=" + ([.labels.nodes[].name] | join(","))' issues-to-email.json
+
           echo "EMAIL_SUBJECT=Rancher old open issues (auth/RBAC/projects/audit) - $(date -u +%Y-%m-%d)" >> $GITHUB_ENV
 
           {
-            echo "# rancher/rancher: Old open issues for auth/RBAC/projects/audit (no team labels)"
+            echo "# rancher/rancher: Old open issues for auth/RBAC/projects/audit (no team/* labels)"
             echo
             echo "Generated: $(date -u +"%Y-%m-%d %H:%M UTC")"
             echo
@@ -105,11 +117,12 @@ jobs:
               echo
               jq -r '
                 .[] |
-                "- [#\(.number)](\(.url)) \(.title)\n  - created: \(.createdAt)\n  - updated: \(.updatedAt)\n  - author: \(.author.login // "unknown")\n  - labels: " + ([.labels.nodes[].name] | join(\", \"))
+                "- [#\(.number)](\(.url)) \(.title)\n  - created: \(.createdAt)\n  - updated: \(.updatedAt)\n  - author: \(.author.login // "unknown")\n  - labels: " + ([.labels.nodes[].name] | join(", "))
               ' issues-to-email.json
             fi
           } > email.md
 
+          # If we have issues, append their URLs to the seen list
           if [ "$COUNT" -gt 0 ]; then
             jq -r '.[].url' issues-to-email.json >> .state/seen-issues.txt
             sort -u .state/seen-issues.txt -o .state/seen-issues.txt
