@@ -1,0 +1,143 @@
+name: "Email old Rancher issues (auth/rbac/projects/audit)"
+
+on:
+  schedule:
+    # Mondays and Thursdays at 09:00 UTC (adjust as desired)
+    - cron: "0 9 * * 1,4"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # needed to commit the seen-issues file
+  actions: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure seen list exists
+        run: |
+          mkdir -p .state
+          touch .state/seen-issues.txt
+
+      - name: Query issues and build email body (max 10, no repeats)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          QUERY='repo:rancher/rancher is:issue is:open (auth OR authentication OR oidc OR saml OR ldap OR dex OR keycloak OR okta OR azuread OR rbac OR "clusterrole" OR "roletemplate" OR crtb OR prtb OR "clusterroletemplatebinding" OR "projectroletemplatebinding" OR project OR projects OR namespace OR audit OR "audit log" OR auditlogging)'
+
+          echo "Running search: $QUERY"
+
+          gh api graphql -f query='
+            query($q: String!, $n: Int!, $after: String) {
+              search(query: $q, type: ISSUE, first: $n, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  ... on Issue {
+                    number
+                    title
+                    url
+                    createdAt
+                    updatedAt
+                    author { login }
+                    labels(first: 50) { nodes { name } }
+                  }
+                }
+              }
+            }' -f q="$QUERY" -F n=100 > page1.json
+
+          HAS_NEXT=$(jq -r '.data.search.pageInfo.hasNextPage' page1.json)
+          if [ "$HAS_NEXT" = "true" ]; then
+            CURSOR=$(jq -r '.data.search.pageInfo.endCursor' page1.json)
+            gh api graphql -f query='
+              query($q: String!, $n: Int!, $after: String) {
+                search(query: $q, type: ISSUE, first: $n, after: $after) {
+                  nodes {
+                    ... on Issue {
+                      number
+                      title
+                      url
+                      createdAt
+                      updatedAt
+                      author { login }
+                      labels(first: 50) { nodes { name } }
+                    }
+                  }
+                }
+              }' -f q="$QUERY" -F n=100 -f after="$CURSOR" > page2.json
+          else
+            echo '{"data":{"search":{"nodes":[]}}}' > page2.json
+          fi
+
+          SEEN_JSON=$(awk 'NF {print}' .state/seen-issues.txt | jq -R -s 'split("\n") | map(select(length>0))')
+
+          jq -s --argjson seen "$SEEN_JSON" '
+            ([.[0].data.search.nodes[], .[1].data.search.nodes[]] |
+              map(select(
+                ([.labels.nodes[].name] | map(ascii_downcase) | any(contains("team")) | not)
+              )) |
+              map(select(.url as $u | ($seen | index($u)) == null)) |
+              sort_by(.createdAt) |
+              .[0:10]
+            )
+          ' page1.json page2.json > issues-to-email.json
+
+          COUNT=$(jq 'length' issues-to-email.json)
+          echo "New issues to email (max 10): $COUNT"
+
+          echo "EMAIL_SUBJECT=Rancher old open issues (auth/RBAC/projects/audit) - $(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+
+          {
+            echo "# rancher/rancher: Old open issues for auth/RBAC/projects/audit (no team labels)"
+            echo
+            echo "Generated: $(date -u +"%Y-%m-%d %H:%M UTC")"
+            echo
+            if [ "$COUNT" -eq 0 ]; then
+              echo "_No new matching issues (all candidates already emailed, or none found)._"
+            else
+              echo "## Oldest first (up to 10, never repeated)"
+              echo
+              jq -r '
+                .[] |
+                "- [#\(.number)](\(.url)) \(.title)\n  - created: \(.createdAt)\n  - updated: \(.updatedAt)\n  - author: \(.author.login // "unknown")\n  - labels: " + ([.labels.nodes[].name] | join(\", \"))
+              ' issues-to-email.json
+            fi
+          } > email.md
+
+          if [ "$COUNT" -gt 0 ]; then
+            jq -r '.[].url' issues-to-email.json >> .state/seen-issues.txt
+            sort -u .state/seen-issues.txt -o .state/seen-issues.txt
+          fi
+
+      - name: Send email
+        uses: dawidd6/action-send-mail@v4
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ env.EMAIL_SUBJECT }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+          secure: true
+          content_type: text/markdown
+          body: file://email.md
+
+      - name: Commit updated seen list (if changed)
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .state/seen-issues.txt
+          git commit -m "chore: update seen issues list"
+          git push
