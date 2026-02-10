@@ -35,7 +35,9 @@ jobs:
 
           echo "Running search: $QUERY"
 
-          # Fetch up to 2000 results; filter/sort/limit client-side
+          # Fetch up to 200 results (2 pages); filter/sort/limit client-side.
+          # Note: GitHub search generally caps at 1000 total results; if you try to fetch more,
+          # you may need to further refine the query.
           gh api graphql -f query='
             query($q: String!, $n: Int!, $after: String) {
               search(query: $q, type: ISSUE, first: $n, after: $after) {
@@ -52,7 +54,42 @@ jobs:
                   }
                 }
               }
-            }' -f q="$QUERY" -F n=100 > page1.json
+            }' -f q="$QUERY" -F n=1000 > page1.json
+
+          # --- DEBUG CHECKS (page1) ---
+          echo "=== DEBUG: page1.json shape keys ==="
+          jq 'keys' page1.json
+
+          echo "=== DEBUG: page1 node count ==="
+          jq '.data.search.nodes | length' page1.json
+
+          echo "=== DEBUG: page1 first node sample ==="
+          jq '
+            .data.search.nodes[0]
+            | {
+                number,
+                url,
+                createdAt,
+                updatedAt,
+                labelCount: ((.labels.nodes // []) | length),
+                labels: ((.labels.nodes // []) | map(.name))
+              }
+          ' page1.json
+
+          echo "=== DEBUG: page1 count with NO team/* label ==="
+          jq '
+            .data.search.nodes
+            | map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/"))) | not))
+            | length
+          ' page1.json
+
+          echo "=== DEBUG: page1 contains issue #40482? ==="
+          jq '
+            .data.search.nodes
+            | map(select(.number == 40482))
+            | length
+          ' page1.json
+          # --- END DEBUG CHECKS (page1) ---
 
           HAS_NEXT=$(jq -r '.data.search.pageInfo.hasNextPage' page1.json)
           if [ "$HAS_NEXT" = "true" ]; then
@@ -77,6 +114,25 @@ jobs:
             echo '{"data":{"search":{"nodes":[]}}}' > page2.json
           fi
 
+          # --- DEBUG CHECKS (combined) ---
+          echo "=== DEBUG: combined (page1+page2) node count ==="
+          jq -s '[.[0].data.search.nodes[], .[1].data.search.nodes[]] | length' page1.json page2.json
+
+          echo "=== DEBUG: combined count with NO team/* label ==="
+          jq -s '
+            [.[0].data.search.nodes[], .[1].data.search.nodes[]]
+            | map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/"))) | not))
+            | length
+          ' page1.json page2.json
+
+          echo "=== DEBUG: combined contains issue #40482? ==="
+          jq -s '
+            [.[0].data.search.nodes[], .[1].data.search.nodes[]]
+            | map(select(.number == 40482))
+            | length
+          ' page1.json page2.json
+          # --- END DEBUG CHECKS (combined) ---
+
           # Read seen URLs into a JSON array for jq
           SEEN_JSON=$(awk 'NF {print}' .state/seen-issues.txt | jq -R -s 'split("\n") | map(select(length>0))')
 
@@ -84,7 +140,7 @@ jobs:
             ([.[0].data.search.nodes[], .[1].data.search.nodes[]] |
               # Exclude any issue with any label starting with "team/" (case-insensitive)
               map(select(
-                ([.labels.nodes[].name] | map(ascii_downcase) | any(startswith("team/")) | not)
+                ([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/")) | not)
               )) |
               # Exclude issues already emailed
               map(select(.url as $u | ($seen | index($u)) == null)) |
@@ -102,7 +158,7 @@ jobs:
           awk 'NF{c++} END{print c+0}' .state/seen-issues.txt
 
           echo "Sample candidates (first 5):"
-          jq -r '.[0:5][] | "\(.createdAt) \(.url) labels=" + ([.labels.nodes[].name] | join(","))' issues-to-email.json
+          jq -r '.[0:5][] | "\(.createdAt) \(.url) labels=" + ([(.labels.nodes // [])[].name] | join(","))' issues-to-email.json
 
           echo "EMAIL_SUBJECT=Rancher old open issues (auth/RBAC/projects/audit) - $(date -u +%Y-%m-%d)" >> $GITHUB_ENV
 
@@ -118,7 +174,7 @@ jobs:
               echo
               jq -r '
                 .[] |
-                "- [#\(.number)](\(.url)) \(.title)\n  - created: \(.createdAt)\n  - updated: \(.updatedAt)\n  - author: \(.author.login // "unknown")\n  - labels: " + ([.labels.nodes[].name] | join(", "))
+                "- [#\(.number)](\(.url)) \(.title)\n  - created: \(.createdAt)\n  - updated: \(.updatedAt)\n  - author: \(.author.login // "unknown")\n  - labels: " + ([(.labels.nodes // [])[].name] | join(", "))
               ' issues-to-email.json
             fi
           } > email.md
