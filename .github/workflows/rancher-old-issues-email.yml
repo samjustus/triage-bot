@@ -35,37 +35,85 @@ jobs:
 
           echo "Running search: $QUERY"
 
-          # Fetch up to 200 results (2 pages); filter/sort/limit client-side.
-          # Note: GitHub search generally caps at 1000 total results; if you try to fetch more,
-          # you may need to further refine the query.
-          gh api graphql -f query='
-            query($q: String!, $n: Int!, $after: String) {
-              search(query: $q, type: ISSUE, first: $n, after: $after) {
-                pageInfo { hasNextPage endCursor }
-                nodes {
-                  ... on Issue {
-                    number
-                    title
-                    url
-                    createdAt
-                    updatedAt
-                    author { login }
-                    labels(first: 50) { nodes { name } }
+          # NOTE:
+          # - GitHub "search" has practical caps (commonly 1000 results addressable).
+          # - So "fetch 2000" is implemented as 20 pages x 100, but you may not actually
+          #   get 2000 distinct results depending on GitHub search limits.
+          PER_PAGE=100
+          MAX_PAGES=20
+
+          # Initial empty combined array
+          echo '[]' > all.json
+
+          after_cursor=""
+          page=1
+          while [ "$page" -le "$MAX_PAGES" ]; do
+            echo "Fetching page $page / $MAX_PAGES (after_cursor=${after_cursor:-<none>})"
+
+            if [ -z "$after_cursor" ]; then
+              gh api graphql -f query='
+                query($q: String!, $n: Int!) {
+                  search(query: $q, type: ISSUE, first: $n) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      ... on Issue {
+                        number
+                        title
+                        url
+                        createdAt
+                        updatedAt
+                        author { login }
+                        labels(first: 50) { nodes { name } }
+                      }
+                    }
                   }
-                }
-              }
-            }' -f q="$QUERY" -F n=1000 > page1.json
+                }' -f q="$QUERY" -F n="$PER_PAGE" > page.json
+            else
+              gh api graphql -f query='
+                query($q: String!, $n: Int!, $after: String) {
+                  search(query: $q, type: ISSUE, first: $n, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      ... on Issue {
+                        number
+                        title
+                        url
+                        createdAt
+                        updatedAt
+                        author { login }
+                        labels(first: 50) { nodes { name } }
+                      }
+                    }
+                  }
+                }' -f q="$QUERY" -F n="$PER_PAGE" -f after="$after_cursor" > page.json
+            fi
 
-          # --- DEBUG CHECKS (page1) ---
-          echo "=== DEBUG: page1.json shape keys ==="
-          jq 'keys' page1.json
+            fetched=$(jq '.data.search.nodes | length' page.json)
+            has_next=$(jq -r '.data.search.pageInfo.hasNextPage' page.json)
+            end_cursor=$(jq -r '.data.search.pageInfo.endCursor' page.json)
 
-          echo "=== DEBUG: page1 node count ==="
-          jq '.data.search.nodes | length' page1.json
+            echo "Fetched nodes this page: $fetched"
 
-          echo "=== DEBUG: page1 first node sample ==="
+            # Append nodes into all.json
+            jq -s '.[0] + (.[1].data.search.nodes // [])' all.json page.json > all.tmp.json
+            mv all.tmp.json all.json
+
+            if [ "$has_next" != "true" ]; then
+              echo "No next page. Stopping pagination."
+              break
+            fi
+
+            after_cursor="$end_cursor"
+            page=$((page + 1))
+          done
+
+          echo "=== DEBUG: total fetched nodes (all pages combined) ==="
+          jq 'length' all.json
+
+          # --- DEBUG CHECKS (combined all pages) ---
+          echo "=== DEBUG: all.json first node sample ==="
           jq '
-            .data.search.nodes[0]
+            .[0]
             | {
                 number,
                 url,
@@ -74,82 +122,36 @@ jobs:
                 labelCount: ((.labels.nodes // []) | length),
                 labels: ((.labels.nodes // []) | map(.name))
               }
-          ' page1.json
+          ' all.json
 
-          echo "=== DEBUG: page1 count with NO team/* label ==="
+          echo "=== DEBUG: all.json count with NO team/* label (pre-seen) ==="
           jq '
-            .data.search.nodes
-            | map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/"))) | not))
+            map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/"))) | not))
             | length
-          ' page1.json
+          ' all.json
 
-          echo "=== DEBUG: page1 contains issue #40482? ==="
+          echo "=== DEBUG: all.json contains issue #40482? ==="
           jq '
-            .data.search.nodes
-            | map(select(.number == 40482))
+            map(select(.number == 40482))
             | length
-          ' page1.json
-          # --- END DEBUG CHECKS (page1) ---
-
-          HAS_NEXT=$(jq -r '.data.search.pageInfo.hasNextPage' page1.json)
-          if [ "$HAS_NEXT" = "true" ]; then
-            CURSOR=$(jq -r '.data.search.pageInfo.endCursor' page1.json)
-            gh api graphql -f query='
-              query($q: String!, $n: Int!, $after: String) {
-                search(query: $q, type: ISSUE, first: $n, after: $after) {
-                  nodes {
-                    ... on Issue {
-                      number
-                      title
-                      url
-                      createdAt
-                      updatedAt
-                      author { login }
-                      labels(first: 50) { nodes { name } }
-                    }
-                  }
-                }
-              }' -f q="$QUERY" -F n=100 -f after="$CURSOR" > page2.json
-          else
-            echo '{"data":{"search":{"nodes":[]}}}' > page2.json
-          fi
-
-          # --- DEBUG CHECKS (combined) ---
-          echo "=== DEBUG: combined (page1+page2) node count ==="
-          jq -s '[.[0].data.search.nodes[], .[1].data.search.nodes[]] | length' page1.json page2.json
-
-          echo "=== DEBUG: combined count with NO team/* label ==="
-          jq -s '
-            [.[0].data.search.nodes[], .[1].data.search.nodes[]]
-            | map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/"))) | not))
-            | length
-          ' page1.json page2.json
-
-          echo "=== DEBUG: combined contains issue #40482? ==="
-          jq -s '
-            [.[0].data.search.nodes[], .[1].data.search.nodes[]]
-            | map(select(.number == 40482))
-            | length
-          ' page1.json page2.json
-          # --- END DEBUG CHECKS (combined) ---
+          ' all.json
+          # --- END DEBUG CHECKS ---
 
           # Read seen URLs into a JSON array for jq
           SEEN_JSON=$(awk 'NF {print}' .state/seen-issues.txt | jq -R -s 'split("\n") | map(select(length>0))')
 
-          jq -s --argjson seen "$SEEN_JSON" '
-            ([.[0].data.search.nodes[], .[1].data.search.nodes[]] |
-              # Exclude any issue with any label starting with "team/" (case-insensitive)
-              map(select(
-                ([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/")) | not)
-              )) |
-              # Exclude issues already emailed
-              map(select(.url as $u | ($seen | index($u)) == null)) |
-              # Oldest first
-              sort_by(.createdAt) |
-              # Limit to 10
-              .[0:10]
-            )
-          ' page1.json page2.json > issues-to-email.json
+          # Final selection
+          jq --argjson seen "$SEEN_JSON" '
+            . |
+            # Exclude any issue with any label starting with "team/" (case-insensitive)
+            map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/")) | not))) |
+            # Exclude issues already emailed
+            map(select(.url as $u | ($seen | index($u)) == null)) |
+            # Oldest first
+            sort_by(.createdAt) |
+            # Limit to 10
+            .[0:10]
+          ' all.json > issues-to-email.json
 
           COUNT=$(jq 'length' issues-to-email.json)
           echo "New issues to email (max 10): $COUNT"
@@ -157,8 +159,8 @@ jobs:
           echo "Seen list count:"
           awk 'NF{c++} END{print c+0}' .state/seen-issues.txt
 
-          echo "Sample candidates (first 5):"
-          jq -r '.[0:5][] | "\(.createdAt) \(.url) labels=" + ([(.labels.nodes // [])[].name] | join(","))' issues-to-email.json
+          echo "Sample candidates (first 10):"
+          jq -r '.[] | "\(.createdAt) \(.url) labels=" + ([(.labels.nodes // [])[].name] | join(","))' issues-to-email.json
 
           echo "EMAIL_SUBJECT=Rancher old open issues (auth/RBAC/projects/audit) - $(date -u +%Y-%m-%d)" >> $GITHUB_ENV
 
