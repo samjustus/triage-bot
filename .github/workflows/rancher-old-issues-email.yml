@@ -2,7 +2,6 @@ name: "Email old Rancher issues (auth/rbac/projects/audit)"
 
 on:
   schedule:
-    # Mondays and Thursdays at 09:00 UTC (adjust as desired)
     - cron: "0 9 * * 1,4"
   workflow_dispatch: {}
 
@@ -30,9 +29,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # NOTE: Do NOT use `sort:created-asc` here.
-          # GitHub's GraphQL search often returns 0 results when `sort:` is present.
-          QUERY='repo:rancher/rancher is:issue is:open (auth OR authentication OR login OR signin OR "sign in" OR "sign-in" OR logout OR session OR token OR jwt OR "access token" OR "refresh token" OR cookie OR csrf OR sso OR "single sign-on" OR saml OR oidc OR oauth OR oauth2 OR openid OR "openid connect" OR "open id" OR ldap OR ad OR "active directory" OR "azure ad" OR azuread OR okta OR keycloak OR dex OR "auth provider" OR "github auth" OR "gitlab auth" OR "google auth" OR "azure auth" OR "bitbucket auth" OR rbac OR permission OR permissions OR authorize OR authorization OR "access control" OR "global role" OR globalrole OR "global role binding" OR "role binding" OR rolebinding OR clusterrolebinding OR clusterrole OR "cluster role" OR "project role" OR "cluster member" OR "project member" OR "role template" OR roletemplate OR roletemplatebinding OR prtb OR crtb OR projectroletemplatebinding OR clusterroletemplatebinding OR subjectaccessreview OR sar OR impersonate OR impersonation OR project OR projects OR "project id" OR namespace OR namespaces OR "move namespace" OR "namespace move" OR "resource quota" OR limitrange OR "cluster scope" OR "project scope" OR audit OR auditing OR "audit log" OR "audit logs" OR auditlogging OR "audit logging" OR webhook OR "audit webhook" OR "audit sink" OR "apiserver audit" OR "kube-apiserver audit" OR fluentbit OR "fluent bit" OR "log forwarding" OR "log forwarder" OR "log shipper")'
+          # GraphQL search already uses `type: ISSUE` below, so DO NOT include `is:issue` here.
+          QUERY='repo:rancher/rancher archived:false is:open (auth OR authentication OR login OR signin OR "sign in" OR "sign-in" OR logout OR session OR token OR jwt OR "access token" OR "refresh token" OR cookie OR csrf OR sso OR "single sign-on" OR saml OR oidc OR oauth OR oauth2 OR openid OR "openid connect" OR "open id" OR ldap OR ad OR "active directory" OR "azure ad" OR azuread OR okta OR keycloak OR dex OR "auth provider" OR "github auth" OR "gitlab auth" OR "google auth" OR "azure auth" OR "bitbucket auth" OR rbac OR permission OR permissions OR authorize OR authorization OR "access control" OR "global role" OR globalrole OR "global role binding" OR "role binding" OR rolebinding OR clusterrolebinding OR clusterrole OR "cluster role" OR "project role" OR "cluster member" OR "project member" OR "role template" OR roletemplate OR roletemplatebinding OR prtb OR crtb OR projectroletemplatebinding OR clusterroletemplatebinding OR subjectaccessreview OR sar OR impersonate OR impersonation OR project OR projects OR "project id" OR namespace OR namespaces OR "move namespace" OR "namespace move" OR "resource quota" OR limitrange OR "cluster scope" OR "project scope" OR audit OR auditing OR "audit log" OR "audit logs" OR auditlogging OR "audit logging" OR webhook OR "audit webhook" OR "audit sink" OR "apiserver audit" OR "kube-apiserver audit" OR fluentbit OR "fluent bit" OR "log forwarding" OR "log forwarder" OR "log shipper")'
           echo "Running search: $QUERY"
 
           echo "=== DEBUG: smoke test search (should be >0) ==="
@@ -45,7 +43,7 @@ jobs:
             }' -f q='repo:rancher/rancher is:issue is:open project' | jq
 
           PER_PAGE=100
-          MAX_PAGES=20  # 20*100 = 2000 attempted (GitHub search may effectively cap around 1000)
+          MAX_PAGES=20
 
           echo '[]' > all.json
 
@@ -98,7 +96,6 @@ jobs:
 
             echo "Fetched nodes this page: $fetched"
 
-            # Append nodes into all.json
             jq -s '.[0] + (.[1].data.search.nodes // [])' all.json page.json > all.tmp.json
             mv all.tmp.json all.json
 
@@ -139,20 +136,14 @@ jobs:
             | length
           ' all.json
 
-          # Seen list as JSON array
           SEEN_JSON=$(awk 'NF {print}' .state/seen-issues.txt | jq -R -s 'split("\n") | map(select(length>0))')
           echo "Seen list count: $(echo "$SEEN_JSON" | jq 'length')"
 
-          # Final selection
           jq --argjson seen "$SEEN_JSON" '
             . |
-            # Exclude any issue with any label starting with "team/" (case-insensitive)
             map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/")) | not))) |
-            # Exclude issues already emailed
             map(select(.url as $u | ($seen | index($u)) == null)) |
-            # Oldest first (within what we fetched)
             sort_by(.createdAt) |
-            # Limit to 10
             .[0:10]
           ' all.json > issues-to-email.json
 
@@ -181,7 +172,6 @@ jobs:
             fi
           } > email.md
 
-          # Update seen list if we actually emailed issues
           if [ "$COUNT" -gt 0 ]; then
             jq -r '.[].url' issues-to-email.json >> .state/seen-issues.txt
             sort -u .state/seen-issues.txt -o .state/seen-issues.txt
