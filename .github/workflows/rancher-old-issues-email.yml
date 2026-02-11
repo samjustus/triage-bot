@@ -1,4 +1,4 @@
-name: "Email old Rancher issues (auth/rbac/projects/audit)"
+name: "Email old Rancher issues (auth/rbac/projects)"
 
 on:
   schedule:
@@ -30,12 +30,12 @@ jobs:
           PER_PAGE=100
           MAX_PAGES=20   # up to 2000 attempted per query; search may cap earlier
 
-          # GraphQL search is picky with huge boolean queries, so we split into smaller ones.
-          # "Audit logging" query removed per request.
+          # GraphQL search is picky with some qualifiers.
+          # `archived:false` was causing issueCount=0, so it is intentionally NOT used.
           QUERIES=(
-            'repo:rancher/rancher archived:false is:open (auth OR authentication OR login OR oidc OR oauth OR oauth2 OR openid OR saml OR sso OR ldap OR "active directory" OR okta OR keycloak OR dex OR token OR jwt)'
-            'repo:rancher/rancher archived:false is:open (rbac OR permission OR permissions OR authorization OR authorize OR "access control" OR "global role" OR globalrole OR rolebinding OR clusterrolebinding OR "role template" OR roletemplate OR crtb OR prtb OR impersonation OR impersonate)'
-            'repo:rancher/rancher archived:false is:open (project OR projects OR namespace OR namespaces OR "project member" OR "cluster member" OR "project role" OR "cluster role" OR "move namespace" OR "resource quota" OR limitrange)'
+            'repo:rancher/rancher is:issue is:open (auth OR authentication OR login OR oidc OR oauth OR oauth2 OR openid OR saml OR sso OR ldap OR "active directory" OR okta OR keycloak OR dex OR token OR jwt)'
+            'repo:rancher/rancher is:issue is:open (rbac OR permission OR permissions OR authorization OR authorize OR "access control" OR "global role" OR globalrole OR rolebinding OR clusterrolebinding OR "role template" OR roletemplate OR crtb OR prtb OR impersonation OR impersonate)'
+            'repo:rancher/rancher is:issue is:open (project OR projects OR namespace OR namespaces OR "project member" OR "cluster member" OR "project role" OR "cluster role" OR "move namespace" OR "resource quota" OR limitrange)'
           )
 
           echo "=== DEBUG: smoke test search (should be >0) ==="
