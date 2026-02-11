@@ -15,8 +15,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Ensure seen list exists
         run: |
@@ -29,9 +27,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # GraphQL search already uses `type: ISSUE` below, so DO NOT include `is:issue` here.
-          QUERY='repo:rancher/rancher archived:false is:open (auth OR authentication OR login OR signin OR "sign in" OR "sign-in" OR logout OR session OR token OR jwt OR "access token" OR "refresh token" OR cookie OR csrf OR sso OR "single sign-on" OR saml OR oidc OR oauth OR oauth2 OR openid OR "openid connect" OR "open id" OR ldap OR ad OR "active directory" OR "azure ad" OR azuread OR okta OR keycloak OR dex OR "auth provider" OR "github auth" OR "gitlab auth" OR "google auth" OR "azure auth" OR "bitbucket auth" OR rbac OR permission OR permissions OR authorize OR authorization OR "access control" OR "global role" OR globalrole OR "global role binding" OR "role binding" OR rolebinding OR clusterrolebinding OR clusterrole OR "cluster role" OR "project role" OR "cluster member" OR "project member" OR "role template" OR roletemplate OR roletemplatebinding OR prtb OR crtb OR projectroletemplatebinding OR clusterroletemplatebinding OR subjectaccessreview OR sar OR impersonate OR impersonation OR project OR projects OR "project id" OR namespace OR namespaces OR "move namespace" OR "namespace move" OR "resource quota" OR limitrange OR "cluster scope" OR "project scope" OR audit OR auditing OR "audit log" OR "audit logs" OR auditlogging OR "audit logging" OR webhook OR "audit webhook" OR "audit sink" OR "apiserver audit" OR "kube-apiserver audit" OR fluentbit OR "fluent bit" OR "log forwarding" OR "log forwarder" OR "log shipper")'
-          echo "Running search: $QUERY"
+          PER_PAGE=100
+          MAX_PAGES=20   # up to 2000 attempted per query; search may cap earlier
+
+          # GraphQL search is picky with huge boolean queries, so we split into smaller ones.
+          # "Audit logging" query removed per request.
+          QUERIES=(
+            'repo:rancher/rancher archived:false is:open (auth OR authentication OR login OR oidc OR oauth OR oauth2 OR openid OR saml OR sso OR ldap OR "active directory" OR okta OR keycloak OR dex OR token OR jwt)'
+            'repo:rancher/rancher archived:false is:open (rbac OR permission OR permissions OR authorization OR authorize OR "access control" OR "global role" OR globalrole OR rolebinding OR clusterrolebinding OR "role template" OR roletemplate OR crtb OR prtb OR impersonation OR impersonate)'
+            'repo:rancher/rancher archived:false is:open (project OR projects OR namespace OR namespaces OR "project member" OR "cluster member" OR "project role" OR "cluster role" OR "move namespace" OR "resource quota" OR limitrange)'
+          )
 
           echo "=== DEBUG: smoke test search (should be >0) ==="
           gh api graphql -f query='
@@ -42,99 +47,94 @@ jobs:
               }
             }' -f q='repo:rancher/rancher is:issue is:open project' | jq
 
-          PER_PAGE=100
-          MAX_PAGES=20
-
           echo '[]' > all.json
 
-          after_cursor=""
-          page=1
-          while [ "$page" -le "$MAX_PAGES" ]; do
-            echo "Fetching page $page / $MAX_PAGES (after_cursor=${after_cursor:-<none>})"
+          run_search() {
+            local q="$1"
+            local after_cursor=""
+            local page=1
 
-            if [ -z "$after_cursor" ]; then
-              gh api graphql -f query='
-                query($q: String!, $n: Int!) {
-                  search(query: $q, type: ISSUE, first: $n) {
-                    pageInfo { hasNextPage endCursor }
-                    nodes {
-                      ... on Issue {
-                        number
-                        title
-                        url
-                        createdAt
-                        updatedAt
-                        author { login }
-                        labels(first: 50) { nodes { name } }
+            echo "=== QUERY: $q ==="
+
+            gh api graphql -f query='
+              query($q: String!) {
+                search(query: $q, type: ISSUE, first: 1) { issueCount }
+              }' -f q="$q" | jq -r '"issueCount=" + (.data.search.issueCount|tostring)'
+
+            while [ "$page" -le "$MAX_PAGES" ]; do
+              if [ -z "$after_cursor" ]; then
+                gh api graphql -f query='
+                  query($q: String!, $n: Int!) {
+                    search(query: $q, type: ISSUE, first: $n) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        ... on Issue {
+                          number
+                          title
+                          url
+                          createdAt
+                          updatedAt
+                          author { login }
+                          labels(first: 50) { nodes { name } }
+                        }
                       }
                     }
-                  }
-                }' -f q="$QUERY" -F n="$PER_PAGE" > page.json
-            else
-              gh api graphql -f query='
-                query($q: String!, $n: Int!, $after: String) {
-                  search(query: $q, type: ISSUE, first: $n, after: $after) {
-                    pageInfo { hasNextPage endCursor }
-                    nodes {
-                      ... on Issue {
-                        number
-                        title
-                        url
-                        createdAt
-                        updatedAt
-                        author { login }
-                        labels(first: 50) { nodes { name } }
+                  }' -f q="$q" -F n="$PER_PAGE" > page.json
+              else
+                gh api graphql -f query='
+                  query($q: String!, $n: Int!, $after: String) {
+                    search(query: $q, type: ISSUE, first: $n, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        ... on Issue {
+                          number
+                          title
+                          url
+                          createdAt
+                          updatedAt
+                          author { login }
+                          labels(first: 50) { nodes { name } }
+                        }
                       }
                     }
-                  }
-                }' -f q="$QUERY" -F n="$PER_PAGE" -f after="$after_cursor" > page.json
-            fi
+                  }' -f q="$q" -F n="$PER_PAGE" -f after="$after_cursor" > page.json
+              fi
 
-            fetched=$(jq '.data.search.nodes | length' page.json)
-            has_next=$(jq -r '.data.search.pageInfo.hasNextPage' page.json)
-            end_cursor=$(jq -r '.data.search.pageInfo.endCursor' page.json)
+              local fetched
+              fetched=$(jq '.data.search.nodes | length' page.json)
+              local has_next
+              has_next=$(jq -r '.data.search.pageInfo.hasNextPage' page.json)
+              local end_cursor
+              end_cursor=$(jq -r '.data.search.pageInfo.endCursor' page.json)
 
-            echo "Fetched nodes this page: $fetched"
+              echo "page=$page fetched=$fetched hasNext=$has_next"
 
-            jq -s '.[0] + (.[1].data.search.nodes // [])' all.json page.json > all.tmp.json
-            mv all.tmp.json all.json
+              jq -s '.[0] + (.[1].data.search.nodes // [])' all.json page.json > all.tmp.json
+              mv all.tmp.json all.json
 
-            if [ "$has_next" != "true" ]; then
-              echo "No next page. Stopping pagination."
-              break
-            fi
+              if [ "$has_next" != "true" ]; then
+                break
+              fi
 
-            after_cursor="$end_cursor"
-            page=$((page + 1))
+              after_cursor="$end_cursor"
+              page=$((page + 1))
+            done
+          }
+
+          for q in "${QUERIES[@]}"; do
+            run_search "$q"
           done
 
-          echo "=== DEBUG: total fetched nodes (all pages combined) ==="
+          echo "=== DEBUG: total fetched nodes (union pre-dedupe) ==="
           jq 'length' all.json
 
-          echo "=== DEBUG: all.json first node sample ==="
-          jq '
-            .[0]
-            | {
-                number,
-                url,
-                createdAt,
-                updatedAt,
-                labelCount: ((.labels.nodes // []) | length),
-                labels: ((.labels.nodes // []) | map(.name))
-              }
-          ' all.json
+          jq 'unique_by(.url)' all.json > all.deduped.json
 
-          echo "=== DEBUG: all.json count with NO team/* label (pre-seen) ==="
-          jq '
-            map(select(([(.labels.nodes // [])[].name] | map(ascii_downcase) | any(startswith("team/"))) | not))
-            | length
-          ' all.json
+          echo "=== DEBUG: total fetched nodes (after dedupe) ==="
+          jq 'length' all.deduped.json
 
-          echo "=== DEBUG: all.json contains issue #40482? ==="
-          jq '
-            map(select(.number == 40482))
-            | length
-          ' all.json
+          echo "=== DEBUG: contains issue #40482? (after dedupe) ==="
+          jq 'map(select(.number == 40482)) | length' all.deduped.json
 
           SEEN_JSON=$(awk 'NF {print}' .state/seen-issues.txt | jq -R -s 'split("\n") | map(select(length>0))')
           echo "Seen list count: $(echo "$SEEN_JSON" | jq 'length')"
@@ -145,7 +145,7 @@ jobs:
             map(select(.url as $u | ($seen | index($u)) == null)) |
             sort_by(.createdAt) |
             .[0:10]
-          ' all.json > issues-to-email.json
+          ' all.deduped.json > issues-to-email.json
 
           COUNT=$(jq 'length' issues-to-email.json)
           echo "New issues to email (max 10): $COUNT"
@@ -153,10 +153,10 @@ jobs:
           echo "Sample candidates (first 10):"
           jq -r '.[] | "\(.createdAt) \(.url) labels=" + ([(.labels.nodes // [])[].name] | join(","))' issues-to-email.json
 
-          echo "EMAIL_SUBJECT=Rancher old open issues (auth/RBAC/projects/audit) - $(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+          echo "EMAIL_SUBJECT=Rancher old open issues (auth/RBAC/projects) - $(date -u +%Y-%m-%d)" >> $GITHUB_ENV
 
           {
-            echo "# rancher/rancher: Old open issues for auth/RBAC/projects/audit (no team/* labels)"
+            echo "# rancher/rancher: Old open issues for auth/RBAC/projects (no team/* labels)"
             echo
             echo "Generated: $(date -u +"%Y-%m-%d %H:%M UTC")"
             echo
